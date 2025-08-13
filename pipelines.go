@@ -52,15 +52,13 @@ func (this *group) runFannedOutStation(input, final chan any) {
 		go this.runStation(station, input, out)
 	}
 	var waiter sync.WaitGroup
-	waiter.Add(len(outs))
 	defer waiter.Wait()
 	for _, out := range outs {
-		go func(out chan any) {
-			defer waiter.Done()
+		waiter.Go(func() {
 			for item := range out {
 				final <- item
 			}
-		}(out)
+		})
 	}
 }
 func (this *group) runStation(station Station, input, output chan any) {
