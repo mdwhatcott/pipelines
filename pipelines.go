@@ -2,52 +2,63 @@ package pipelines
 
 import "sync"
 
-func New(input chan any, options ...option) Listener {
-	config := new(config)
-	config.apply(options...)
-	return &listener{
-		input:  input,
-		logger: config.logger,
-		groups: config.groups,
+func New[T any](input <-chan T, opts ...option) Pipeline[T] {
+	c := new(config)
+	c.apply(opts...)
+	return Pipeline[T]{
+		build:  func() <-chan T { return input },
+		logger: c.logger,
 	}
 }
 
-type listener struct {
+func Then[In, Out any](
+	prev Pipeline[In],
+	stations []Station[In, Out],
+	opts ...groupOption[Out],
+) Pipeline[Out] {
+	if len(stations) == 0 {
+		panic("pipelines: Then requires at least one station")
+	}
+	g := newGroup(stations, opts...)
+	return Pipeline[Out]{
+		build: func() <-chan Out {
+			in := prev.build()
+			out := make(chan Out, g.bufferCapacity)
+			go g.run(in, out)
+			return out
+		},
+		logger: prev.logger,
+	}
+}
+
+type Pipeline[Out any] struct {
+	build  func() <-chan Out
 	logger Logger
-	groups []*group
-	input  chan any
 }
 
-func (this *listener) Listen() {
-	input := this.input
-	for _, group := range this.groups {
-		output := make(chan any, group.bufferCapacity)
-		go group.run(input, output)
-		input = output
-	}
-	for v := range input {
+func (this Pipeline[Out]) Listen() {
+	for v := range this.build() {
 		this.logger.Printf("value at end of pipeline: %v", v)
 	}
 }
 
-type group struct {
-	bufferCapacity        int
-	sendViaSelectCallback func(any)
-	stations              []Station
+type group[In, Out any] struct {
+	groupConfig[Out]
+	stations []Station[In, Out]
 }
 
-func (this *group) run(input, output chan any) {
+func (this *group[In, Out]) run(input <-chan In, output chan Out) {
 	if len(this.stations) > 1 {
 		this.runFannedOutStation(input, output)
 	} else {
 		this.runStation(this.stations[0], input, output)
 	}
 }
-func (this *group) runFannedOutStation(input, final chan any) {
+func (this *group[In, Out]) runFannedOutStation(input <-chan In, final chan Out) {
 	defer close(final)
-	var outs []chan any
+	var outs []chan Out
 	for _, station := range this.stations {
-		out := make(chan any)
+		out := make(chan Out)
 		outs = append(outs, out)
 		go this.runStation(station, input, out)
 	}
@@ -61,24 +72,24 @@ func (this *group) runFannedOutStation(input, final chan any) {
 		})
 	}
 }
-func (this *group) runStation(station Station, input, output chan any) {
+func (this *group[In, Out]) runStation(station Station[In, Out], input <-chan In, output chan Out) {
 	defer close(output)
-	var out func(v any)
+	var out func(Out)
 	if this.sendViaSelectCallback != nil {
 		out = sendViaSelect(output, this.sendViaSelectCallback)
 	} else {
 		out = blockingSend(output)
 	}
-	if finalizer, ok := station.(Finalizer); ok {
+	if finalizer, ok := station.(Finalizer[Out]); ok {
 		defer finalizer.Finalize(out)
 	}
-	for input := range input {
-		station.Do(input, out)
+	for value := range input {
+		station.Do(value, out)
 	}
 }
 
-func sendViaSelect(output chan any, callback func(any)) func(any) {
-	return func(v any) {
+func sendViaSelect[Out any](output chan Out, callback func(Out)) func(Out) {
+	return func(v Out) {
 		select {
 		case output <- v:
 		default:
@@ -86,6 +97,6 @@ func sendViaSelect(output chan any, callback func(any)) func(any) {
 		}
 	}
 }
-func blockingSend(output chan any) func(any) {
-	return func(v any) { output <- v }
+func blockingSend[Out any](output chan Out) func(Out) {
+	return func(v Out) { output <- v }
 }

@@ -4,7 +4,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/mdw-go/pipelines/v2"
+	"github.com/mdw-go/pipelines/v3"
 )
 
 func TestLoad(t *testing.T) {
@@ -12,18 +12,18 @@ func TestLoad(t *testing.T) {
 		t.Skip("skipping test in short mode.")
 	}
 
-	var group1 []pipelines.Station
+	var group1 []pipelines.Station[struct{}, struct{}]
 	for range 1024 {
 		group1 = append(group1, NewLoadTestStation())
 	}
 
-	var group2 []pipelines.Station
+	var group2 []pipelines.Station[struct{}, struct{}]
 	for range 8 {
 		group2 = append(group2, NewLoadTestStation())
 	}
 
 	const totalItems = 10_000_000
-	input := make(chan any)
+	input := make(chan struct{})
 	go func() {
 		defer close(input)
 		for range totalItems {
@@ -34,25 +34,20 @@ func TestLoad(t *testing.T) {
 	station3 := NewLoadTestStation()
 	station4 := NewLoadTestFinalStation(t, totalItems)
 
-	listener := pipelines.New(input,
+	p0 := pipelines.New[struct{}](input,
 		pipelines.Options.Logger(&TLogger{T: t}),
-		pipelines.Options.StationGroup(
-			pipelines.GroupOptions.Stations(group1...),
-			pipelines.GroupOptions.SendViaSelect(station4.backdoor),
-		),
-		pipelines.Options.StationGroup(
-			pipelines.GroupOptions.Stations(group2...),
-			pipelines.GroupOptions.BufferedOutput(1000),
-		),
-		pipelines.Options.StationGroup(
-			pipelines.GroupOptions.Stations(station3),
-			pipelines.GroupOptions.BufferedOutput(1000),
-		),
-		pipelines.Options.StationGroup(
-			pipelines.GroupOptions.Stations(station4),
-		),
 	)
-	listener.Listen()
+	p1 := pipelines.Then(p0, group1,
+		pipelines.SendViaSelect[struct{}](station4.backdoor),
+	)
+	p2 := pipelines.Then(p1, group2,
+		pipelines.BufferedOutput[struct{}](1000),
+	)
+	p3 := pipelines.Then(p2, []pipelines.Station[struct{}, struct{}]{station3},
+		pipelines.BufferedOutput[struct{}](1000),
+	)
+	p4 := pipelines.Then(p3, []pipelines.Station[struct{}, struct{}]{station4})
+	p4.Listen()
 
 	for _, station := range append(group1, group2...) {
 		if station.(*LoadTestStation).count == 0 {
@@ -71,7 +66,7 @@ func NewLoadTestStation() *LoadTestStation {
 	return &LoadTestStation{}
 }
 
-func (this *LoadTestStation) Do(input any, output func(any)) {
+func (this *LoadTestStation) Do(input struct{}, output func(struct{})) {
 	this.count++
 	output(input)
 }
@@ -93,11 +88,11 @@ func NewLoadTestFinalStation(t *testing.T, expectedCount int) *LoadTestFinalStat
 		expectedCount:  int64(expectedCount),
 	}
 }
-func (this *LoadTestFinalStation) Do(input any, output func(any)) {
+func (this *LoadTestFinalStation) Do(_ struct{}, _ func(struct{})) {
 	actual := this.processedCount.Add(1)
 	this.progress(actual)
 }
-func (this *LoadTestFinalStation) Finalize(_ func(any)) {
+func (this *LoadTestFinalStation) Finalize(_ func(struct{})) {
 	processed := this.processedCount.Load()
 	backdoor := this.backdoorCount.Load()
 	this.t.Logf("Station finished after processing %d items (%d items were discarded)", processed, backdoor)
@@ -105,7 +100,7 @@ func (this *LoadTestFinalStation) Finalize(_ func(any)) {
 		this.t.Logf("expected %d total items, got %d", this.expectedCount, processed+backdoor)
 	}
 }
-func (this *LoadTestFinalStation) backdoor(any) {
+func (this *LoadTestFinalStation) backdoor(struct{}) {
 	_ = this.backdoorCount.Add(1)
 }
 
