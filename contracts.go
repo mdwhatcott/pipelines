@@ -4,14 +4,10 @@ type Logger interface {
 	Printf(format string, args ...any)
 }
 
-type Listener interface {
-	Listen()
+type Station[In, Out any] interface {
+	Do(input In, output func(Out))
 }
 
-type Station interface {
-	Do(input any, output func(any))
-}
-
-type Finalizer interface {
-	Finalize(output func(any))
+type Finalizer[Out any] interface {
+	Finalize(output func(Out))
 }

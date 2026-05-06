@@ -6,11 +6,11 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/mdw-go/pipelines/v2"
+	"github.com/mdw-go/pipelines/v3"
 )
 
 func TestNoStations_AllValuesLogged(t *testing.T) {
-	input := make(chan any)
+	input := make(chan int)
 	go func() {
 		defer close(input)
 		for x := range 10 {
@@ -18,10 +18,10 @@ func TestNoStations_AllValuesLogged(t *testing.T) {
 		}
 	}()
 	logger := &TLogger{T: t}
-	listener := pipelines.New(input,
+	pipeline := pipelines.New[int](input,
 		pipelines.Options.Logger(logger),
 	)
-	listener.Listen()
+	pipeline.Listen()
 
 	if logger.count != 10 {
 		t.Errorf("got %d log calls, should have 10", logger.count)
@@ -34,7 +34,7 @@ func TestNoStations_AllValuesLogged(t *testing.T) {
 // Coincidentally, using github.com/mdw-go/funcy/ranger you can achieve the same result as follows:
 // Reduce(op.Add, 0, Take(10, Filter(is.Even, Map(op.Square, RangeOpen(0, 1)))))
 func TestPipelineExample(t *testing.T) {
-	input := make(chan any)
+	input := make(chan int)
 	go func() {
 		defer close(input)
 		for x := range 50 {
@@ -48,7 +48,7 @@ func TestPipelineExample(t *testing.T) {
 		squares = NewSquares()
 		evens   = NewEvens()
 		firstN  = NewFirstN(10)
-		sums    = []pipelines.Station{
+		sums    = []pipelines.Station[int, int64]{
 			NewSum(sum, closed),
 			NewSum(sum, closed),
 			NewSum(sum, closed),
@@ -57,17 +57,15 @@ func TestPipelineExample(t *testing.T) {
 		}
 		catchAll = NewCatchAll()
 	)
-	listener := pipelines.New(input,
+	p0 := pipelines.New[int](input,
 		pipelines.Options.Logger(&TLogger{T: t}),
-		pipelines.Options.StationGroup(pipelines.GroupOptions.Stations(squares)),
-		pipelines.Options.StationGroup(pipelines.GroupOptions.Stations(evens)),
-		pipelines.Options.StationGroup(pipelines.GroupOptions.Stations()), // no stations, will be ignored
-		pipelines.Options.StationGroup(pipelines.GroupOptions.Stations(firstN)),
-		pipelines.Options.StationGroup(pipelines.GroupOptions.Stations(sums...)), // fan-out
-		pipelines.Options.StationGroup(pipelines.GroupOptions.Stations(catchAll)),
 	)
-
-	listener.Listen()
+	p1 := pipelines.Then(p0, []pipelines.Station[int, int]{squares})
+	p2 := pipelines.Then(p1, []pipelines.Station[int, int]{evens})
+	p3 := pipelines.Then(p2, []pipelines.Station[int, int]{firstN})
+	p4 := pipelines.Then(p3, sums) // fan-out
+	p5 := pipelines.Then(p4, []pipelines.Station[int64, struct{}]{catchAll})
+	p5.Listen()
 
 	const expected = 1140
 	if total := sum.Load(); total != expected {
@@ -97,31 +95,25 @@ func (this *TLogger) Printf(format string, args ...any) {
 
 type Squares struct{}
 
-func NewSquares() pipelines.Station {
+func NewSquares() *Squares {
 	return &Squares{}
 }
 
-func (this *Squares) Do(input any, output func(any)) {
-	switch input := input.(type) {
-	case int:
-		output(input * input)
-	}
+func (this *Squares) Do(input int, output func(int)) {
+	output(input * input)
 }
 
 ///////////////////////////////
 
 type Evens struct{}
 
-func NewEvens() pipelines.Station {
+func NewEvens() *Evens {
 	return &Evens{}
 }
 
-func (this *Evens) Do(input any, output func(any)) {
-	switch input := input.(type) {
-	case int:
-		if input%2 == 0 {
-			output(input)
-		}
+func (this *Evens) Do(input int, output func(int)) {
+	if input%2 == 0 {
+		output(input)
 	}
 }
 
@@ -132,13 +124,13 @@ type FirstN struct {
 	handled *atomic.Int64
 }
 
-func NewFirstN(n int64) pipelines.Station {
+func NewFirstN(n int64) *FirstN {
 	N := new(atomic.Int64)
 	N.Add(n)
 	return &FirstN{N: N, handled: new(atomic.Int64)}
 }
 
-func (this *FirstN) Do(input any, output func(any)) {
+func (this *FirstN) Do(input int, output func(int)) {
 	if this.handled.Load() >= this.N.Load() {
 		return
 	}
@@ -148,24 +140,23 @@ func (this *FirstN) Do(input any, output func(any)) {
 
 ///////////////////////////////
 
+// Sum aggregates ints arriving via Do and emits a finalization marker (a
+// monotonically increasing count, one per Sum station) via Finalize. Do does
+// not emit; the sum is read by the test from the shared *atomic.Int64.
 type Sum struct {
 	sum       *atomic.Int64
 	finalized *atomic.Int64
 }
 
-func NewSum(sum, finalized *atomic.Int64) pipelines.Station {
+func NewSum(sum, finalized *atomic.Int64) *Sum {
 	return &Sum{sum: sum, finalized: finalized}
 }
 
-func (this *Sum) Do(input any, output func(any)) {
-	switch input := input.(type) {
-	case int:
-		this.sum.Add(int64(input))
-		output(input)
-	}
+func (this *Sum) Do(input int, _ func(int64)) {
+	this.sum.Add(int64(input))
 }
 
-func (this *Sum) Finalize(output func(any)) {
+func (this *Sum) Finalize(output func(int64)) {
 	output(this.finalized.Add(1))
 }
 
@@ -179,9 +170,6 @@ func NewCatchAll() *CatchAll {
 	return &CatchAll{}
 }
 
-func (this *CatchAll) Do(input any, _ func(any)) {
-	switch input := input.(type) {
-	case int64:
-		this.final = append(this.final, int(input))
-	}
+func (this *CatchAll) Do(input int64, _ func(struct{})) {
+	this.final = append(this.final, int(input))
 }
